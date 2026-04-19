@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cat's Cradle — Hand Tracking</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #020818;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+    color: #00ffff;
+  }
+
+  #container {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  #videoEl {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1);
+    opacity: 0.18;
+    filter: blur(0.5px) saturate(0);
+  }
+
+  /* CRT Scanline Overlay */
+  #crt {
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 255, 255, 0.012) 2px,
+      rgba(0, 255, 255, 0.012) 4px
+    );
+    pointer-events: none;
+    z-index: 10;
+  }
+
+  /* Vignette */
+  #vignette {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(2,8,24,0.85) 100%);
+    pointer-events: none;
+    z-index: 11;
+  }
+
+  #canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 5;
+  }
+
+  #ui {
+    position: absolute;
+    bottom: 32px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    text-align: center;
+    letter-spacing: 0.15em;
+    font-size: 11px;
+    opacity: 0.5;
+    text-transform: uppercase;
+  }
+
+  #status {
+    position: absolute;
+    top: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    opacity: 0.4;
+    transition: opacity 0.5s;
+  }
+
+  #status.active { opacity: 0.8; color: #00ffcc; }
+
+  #loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 30;
+    background: #020818;
+    gap: 20px;
+  }
+
+  .loading-title {
+    font-size: 22px;
+    letter-spacing: 0.3em;
+    color: #00ffff;
+    text-transform: uppercase;
+    text-shadow: 0 0 20px rgba(0,255,255,0.6);
+  }
+
+  .loading-sub {
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: #ff00ff;
+    opacity: 0.6;
+    animation: blink 1.2s infinite;
+  }
+
+  @keyframes blink {
+    0%, 100% { opacity: 0.6; }
+    50% { opacity: 0.2; }
+  }
+
+  .loading-bar {
+    width: 200px;
+    height: 2px;
+    background: rgba(0,255,255,0.1);
+    position: relative;
+    overflow: hidden;
+  }
+  .loading-bar::after {
+    content: '';
+    position: absolute;
+    top: 0; left: -100%;
+    width: 100%; height: 100%;
+    background: linear-gradient(90deg, transparent, #00ffff, transparent);
+    animation: slide 1.5s infinite;
+  }
+  @keyframes slide {
+    to { left: 200%; }
+  }
+</style>
+</head>
+<body>
+<div id="container">
+  <video id="videoEl" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="crt"></div>
+  <div id="vignette"></div>
+  <div id="status">initializing sensors…</div>
+  <div id="ui">bring both hands into frame · fingertips connect the strings</div>
+
+  <div id="loading">
+    <div class="loading-title">Cat's Cradle</div>
+    <div class="loading-bar"></div>
+    <div class="loading-sub">Loading hand tracking models…</div>
+  </div>
+</div>
+
+<!-- MediaPipe Hands -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<script>
+const video = document.getElementById('videoEl');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const loadingEl = document.getElementById('loading');
+
+// Resize canvas to window
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Fingertip landmark indices (thumb, index, middle, ring, pinky)
+const FINGERTIPS = [4, 8, 12, 16, 20];
+// All hand landmark indices
+const ALL_LANDMARKS = Array.from({length: 21}, (_, i) => i);
+
+// Particle pool for touch explosions
+const particles = [];
+
+class Particle {
+  constructor(x, y, color) {
+    this.x = x; this.y = y;
+    this.vx = (Math.random() - 0.5) * 8;
+    this.vy = (Math.random() - 0.5) * 8;
+    this.life = 1.0;
+    this.decay = 0.03 + Math.random() * 0.04;
+    this.size = 2 + Math.random() * 4;
+    this.color = color;
+  }
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.vx *= 0.92;
+    this.vy *= 0.92;
+    this.life -= this.decay;
+  }
+  draw(ctx) {
+    ctx.save();
+    ctx.globalAlpha = this.life * 0.9;
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = this.color;
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size * this.life, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function spawnExplosion(x, y) {
+  const colors = ['#00ffff', '#ff00ff', '#ffff00', '#ffffff'];
+  for (let i = 0; i < 20; i++) {
+    particles.push(new Particle(x, y, colors[Math.floor(Math.random() * colors.length)]));
+  }
+}
+
+// Map normalized coords to canvas
+function toCanvas(lm) {
+  // Video is mirrored via CSS, so flip x
+  return {
+    x: (1 - lm.x) * canvas.width,
+    y: lm.y * canvas.height
+  };
+}
+
+let lastHandData = null;
+let frameCount = 0;
+
+function drawGlowDot(x, y, radius, color, glowColor) {
+  ctx.save();
+  ctx.shadowBlur = 20;
+  ctx.shadowColor = glowColor || color;
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  // Inner bright core
+  ctx.shadowBlur = 6;
+  ctx.beginPath();
+  ctx.arc(x, y, radius * 0.4, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawElasticString(x1, y1, x2, y2, dist, maxDist, colorA, colorB) {
+  const t = Math.min(dist / maxDist, 1);
+  // Thickness: thicker when close, thinner when far
+  const thickness = Math.max(0.5, 2.5 - t * 2);
+  // Glow blur: more glow when close
+  const blur = 20 - t * 12;
+
+  const grad = ctx.createLinearGradient(x1, y1, x2, y2);
+  grad.addColorStop(0, colorA);
+  grad.addColorStop(0.5, t > 0.5 ? '#ffff00' : '#ff00ff');
+  grad.addColorStop(1, colorB);
+
+  ctx.save();
+  ctx.shadowBlur = blur;
+  ctx.shadowColor = t > 0.5 ? '#ffff00' : '#00ffff';
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = thickness;
+  ctx.lineCap = 'round';
+
+  // Slight catenary sag
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2 + dist * 0.06 * (1 - t);
+
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.quadraticCurveTo(mx, my, x2, y2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Track previous fingertip positions to detect touch
+let prevTouchState = {};
+
+function onResults(results) {
+  if (loadingEl.style.display !== 'none') {
+    loadingEl.style.display = 'none';
+  }
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Update & draw particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    particles[i].update();
+    particles[i].draw(ctx);
+    if (particles[i].life <= 0) particles.splice(i, 1);
+  }
+
+  if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+    statusEl.textContent = 'No hands detected';
+    statusEl.className = '';
+    return;
+  }
+
+  const count = results.multiHandLandmarks.length;
+  statusEl.textContent = count === 1 ? '1 hand detected' : '2 hands detected';
+  statusEl.className = count === 2 ? 'active' : '';
+
+  // Identify left/right (since video mirrored, MediaPipe "Right" = visual left)
+  const hands = results.multiHandLandmarks.map((lms, i) => ({
+    lms,
+    label: results.multiHandedness[i]?.label || 'Unknown'
+  }));
+
+  // Colors per hand
+  const handColors = {
+    Left:  { dot: '#ff00ff', glow: '#ff00aa' },
+    Right: { dot: '#00ffff', glow: '#00aaff' }
+  };
+  const defaultColors = { dot: '#ffff00', glow: '#aaff00' };
+
+  // Draw skeleton connections
+  const CONNECTIONS = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [0,9],[9,10],[10,11],[11,12],
+    [0,13],[13,14],[14,15],[15,16],
+    [0,17],[17,18],[18,19],[19,20],
+    [5,9],[9,13],[13,17]
+  ];
+
+  hands.forEach(({ lms, label }) => {
+    const c = handColors[label] || defaultColors;
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    ctx.strokeStyle = c.dot;
+    ctx.lineWidth = 1;
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = c.glow;
+    CONNECTIONS.forEach(([a, b]) => {
+      const pa = toCanvas(lms[a]);
+      const pb = toCanvas(lms[b]);
+      ctx.beginPath();
+      ctx.moveTo(pa.x, pa.y);
+      ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+    });
+    ctx.restore();
+
+    // Draw all landmark dots
+    lms.forEach((lm, idx) => {
+      const p = toCanvas(lm);
+      const isTip = FINGERTIPS.includes(idx);
+      const r = isTip ? 5 : 2.5;
+      drawGlowDot(p.x, p.y, r, isTip ? c.dot : 'rgba(255,255,255,0.5)', c.glow);
+    });
+  });
+
+  // Draw strings between fingertips of both hands
+  if (hands.length === 2) {
+    const h0tips = FINGERTIPS.map(i => toCanvas(hands[0].lms[i]));
+    const h1tips = FINGERTIPS.map(i => toCanvas(hands[1].lms[i]));
+    const maxDist = Math.sqrt(canvas.width ** 2 + canvas.height ** 2) * 0.6;
+
+    const c0 = handColors[hands[0].label]?.dot || '#00ffff';
+    const c1 = handColors[hands[1].label]?.dot || '#ff00ff';
+
+    FINGERTIPS.forEach((_, i) => {
+      const a = h0tips[i];
+      const b = h1tips[i];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      drawElasticString(a.x, a.y, b.x, b.y, dist, maxDist, c0, c1);
+
+      // Detect fingertip touch → explosion
+      const key = `tip_${i}`;
+      const touching = dist < 30;
+      if (touching && !prevTouchState[key]) {
+        spawnExplosion((a.x + b.x) / 2, (a.y + b.y) / 2);
+      }
+      prevTouchState[key] = touching;
+    });
+  }
+
+  frameCount++;
+}
+
+// Init MediaPipe Hands
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+});
+
+hands.setOptions({
+  maxNumHands: 2,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.6
+});
+
+hands.onResults(onResults);
+
+// Camera
+const camera = new Camera(video, {
+  onFrame: async () => {
+    await hands.send({ image: video });
+  },
+  width: 1280,
+  height: 720
+});
+
+camera.start().catch(err => {
+  loadingEl.querySelector('.loading-sub').textContent = 'Camera access denied. Please allow camera.';
+  console.error(err);
+});
+</script>
+</body>
+</html>
